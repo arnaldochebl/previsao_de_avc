@@ -1,0 +1,1120 @@
+---
+title: "Previsão de AVC"
+author: "Arnaldo Chebl"
+date: "2023-11-20"
+output: 
+  html_document:
+    code_folding: hide
+encoding: UTF-8
+
+knit: (function(inputFile, encoding) { 
+      rmarkdown::render(inputFile,
+                    encoding=encoding, 
+                    output_file='index.html') })
+---
+
+## Descrição do problema e análise das métricas de desempenho
+
+O objetivo do trabalho é prever se o paciente vai ter AVC, antes que ele de fato o tenha.
+Vamos utilizar o framework 'tidymodels' para modelar o dataset, empregando técnicas de 'Boosting' e 'Random Forest', ambas com e sem ajuste de parâmetros ('Tuning'). 
+Além disso, usaremos o Keras para desenvolver um modelo baseado em rede neural. 
+Nosso foco principal será minimizar falsos negativos, visando identificar com antecedência os pacientes em risco de derrame para prevenir fatalidades.
+
+
+
+## Setup e Bibliotecas
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  cache = TRUE, 
+  warning = FALSE, 
+  message = FALSE
+)
+options(digits = 4) 
+```
+
+<details>
+<summary>Clique para expandir e ver as bibliotecas carregadas</summary>
+
+```{r Bibliotecas,message=FALSE, include=TRUE}
+library(tidymodels)
+library(skimr)
+library(factoextra)
+library(ggplot2)
+library(plotly)
+library(dplyr)
+library(doParallel)
+library(vip)
+library(broom)
+
+library(knitr)
+
+library("reticulate")
+reticulate::use_python("C:/Users/arnch/anaconda3/python.exe")
+
+library(keras)
+mnist <- dataset_mnist()
+
+library(pROC)
+
+library(conflicted)
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+```
+
+## Input da Base e ajustes básicos
+### Verifica tipos e nulos
+<details>
+<summary>Clique para expandir</summary>
+```{r, leitura}
+df <- read.csv("healthcare-dataset-stroke-data.csv")
+
+df  %>%
+   lapply(type_sum) %>%
+   as_tibble() %>%
+   pivot_longer(cols = 1:ncol(df),
+                names_to = "Coluna",
+               values_to = "Tipo") %>%
+   inner_join(
+    df %>%
+       summarise(across(everything(), ~sum(is.na(.)))) %>%
+       pivot_longer(cols = 1:ncol(df),
+                    names_to = "Coluna",
+                   values_to = "Total NA")
+  )
+
+df %>% glimpse()
+
+df %>% skim() %>% View()
+
+print(paste("Percentual de casos com derrames:", 100 * (df %>% filter(stroke == 1) %>% nrow() / nrow(df))))
+```
+
+### Arruma os tipos das variáveis
+<details>
+<summary>Clique para expandir</summary>
+```{r}
+df <- df %>%
+  mutate(
+          gender = as.factor(gender),
+          hypertension = as.factor(hypertension),
+          heart_disease = as.factor(heart_disease),
+          ever_married = as.factor(ever_married),
+          work_type = as.factor(work_type),
+          Residence_type = as.factor(Residence_type),
+          smoking_status = as.factor(smoking_status),
+          stroke = as.factor(stroke)
+          )
+
+df |> glimpse()
+
+
+#Abaixo verificamos que a variável 'bmi', que está como character, possui valores 'N/A'.
+#Vamos criar uma flag para captar a informação dos valores missing desta váriavel e vamos transformar BMI no tipo numérico.
+
+df$bmi %>% table() %>% sort(decreasing = TRUE) %>% head()
+
+#criamos feature flag
+df$flag <- ifelse(df$bmi == "N/A", 1, 0)
+
+df$bmi <- ifelse(df$bmi == "N/A", NA, df$bmi)
+
+df <- df %>%
+  mutate(
+          flag = as.factor(flag),
+          bmi = as.double(bmi),
+          )
+
+df %>% head(5) %>% glimpse()
+```
+
+Análise das categorias
+```{r}
+# input de dados ----------------------------------------------------------
+categorical_variables <- df %>%
+  select_if(is.factor) %>%
+  names()
+
+for (i in categorical_variables) {
+  cat("Variable:", i, "\n")
+  print(table(df[[i]]))
+  cat("\n")
+}
+
+
+#há apenas um genero do tipo "outro", iremos excluí-lo pois não será possivel treinar o modelo com apenas um registro
+df <- df %>% plotly::filter(gender != "Other")
+```
+
+Tratando nulos da variável 'bmi' com a mediana
+```{r}
+df  %>%
+   lapply(type_sum) %>%
+   as_tibble() %>%
+   pivot_longer(cols = 1:ncol(df),
+                names_to = "Coluna",
+               values_to = "Tipo") %>%
+   inner_join(
+    df %>%
+       summarise(across(everything(), ~sum(is.na(.)))) %>%
+       pivot_longer(cols = 1:ncol(df),
+                    names_to = "Coluna",
+                   values_to = "Total NA")
+  )
+
+# Aplicar mediana aos nulos
+df$bmi[is.na(df$bmi)] <- median(df$bmi, na.rm=TRUE)
+
+# Verificar nulos novamente
+df  %>%
+   lapply(type_sum) %>%
+   as_tibble() %>%
+   pivot_longer(cols = 1:ncol(df),
+                names_to = "Coluna",
+               values_to = "Tipo") %>%
+   inner_join(
+    df %>%
+       summarise(across(everything(), ~sum(is.na(.)))) %>%
+       pivot_longer(cols = 1:ncol(df),
+                    names_to = "Coluna",
+                   values_to = "Total NA")
+  )
+
+```
+
+## Clusterização: k-means
+```{r, cluster1, echo=FALSE}
+
+# Reduzir dataset apenas para indentificador e variáveis numéricas
+df_cluster <- df %>% dplyr::select('id','age','avg_glucose_level','bmi')
+
+# Ajustar estrutura do dataset
+df_cluster <- as.data.frame(df_cluster)
+rownames(df_cluster) <- df_cluster$id #coloca id no indexador
+df_cluster$id <- NULL #remove coluna id
+View(df_cluster)
+
+# Normalizar dados
+df_cluster_scaled <- scale(df_cluster, center = TRUE, scale = TRUE)
+View(df_cluster_scaled)
+
+# Encontrar número de clusters ideal de acordo com o método Silhouette
+fviz_nbclust(df_cluster_scaled, kmeans, method = "silhouette")
+
+# Criar coluna 'cluster' no dataset principal
+set.seed(1)
+df_final_cluster <- df %>% 
+  mutate(cluster = factor(kmeans(df_cluster_scaled, centers = 2, nstart = 10)$cluster))
+
+df <- df_final_cluster
+```
+
+
+## Análise dos clusters
+```{r, cluster analise, echo=FALSE}
+
+# Calcular médias por cluster
+medias <- df_final_cluster %>%
+            group_by(cluster) %>%
+              plotly::summarise(across(everything(), list(mean)))
+
+# Plotar Cluster vs. age
+df_final_cluster %>%
+  ggplot(aes(x=age, color=cluster, fill=cluster)) +
+  geom_histogram(position="dodge")+
+  geom_vline(data=medias, aes(xintercept=age_1, color=cluster),
+             linetype="dashed")+
+  theme(legend.position="top")+
+  labs(x = "age", title = "Cluster vs. age")
+
+# Plotar Cluster vs. avg_glucose_level
+df_final_cluster %>%
+  ggplot(aes(x=avg_glucose_level, color=cluster, fill=cluster)) +
+  geom_histogram(position="dodge")+
+  geom_vline(data=medias, aes(xintercept=avg_glucose_level_1, color=cluster),
+             linetype="dashed")+
+  theme(legend.position="top")+
+  labs(x = "avg_glucose_level", title = "Cluster vs. avg_glucose_level")
+
+
+# Plotar Cluster vs. bmi
+df_final_cluster %>%
+  ggplot(aes(x=bmi, color=cluster, fill=cluster)) +
+  geom_histogram(position="dodge")+
+  geom_vline(data=medias, aes(xintercept=bmi_1, color=cluster),
+             linetype="dashed")+
+  theme(legend.position="top")+
+  labs(x = "bmi", title = "Cluster vs. bmi")
+
+# Plotar Cluster vs. stroke
+df_grouped_stroke <- df_final_cluster %>%
+  group_by(cluster,stroke) %>%
+    plotly::summarise(total_count = n())
+
+
+df_grouped_stroke %>%
+  group_by(cluster) %>%
+    plotly::summarise(pct_stroke = total_count / sum(total_count))
+
+df_grouped_stroke %>%
+  ggplot(aes(x = stroke, y = total_count, fill = cluster)) +
+    # Implement a grouped bar chart
+  geom_bar(position = "dodge", stat = "identity")+
+  labs(x = "stroke", y= "quantidade", title = "Cluster vs. stroke")
+```
+
+Podemos verificar que, em relação ao Cluster 2, no Cluster 1:
+
+- As pessoas são bem mais velhas (a média é 58 x 22)
+- As pessoas tem níveis de glicose mais altos (a média é 117 x 91)
+- As pessoas tem níveis IMC (BMI) mais altos (a média é 32 x 24)
+- AS pessoas sofrem mais infartos (8% x 0.4%)
+
+
+## Análise Exploratória
+```{r, echo=FALSE}
+# Plotar bmi vs. age
+df_final_cluster %>%
+  ggplot(aes(x=age, y=bmi,color=cluster, fill=cluster)) +
+  geom_point(alpha=.5)+
+  theme(legend.position="top")+
+  labs(x = "age", y='bmi', title = "bmi vs. age")+ 
+  theme_minimal()+
+  theme_bw()+
+  facet_grid(~ stroke, scale = "free_y") 
+
+
+# Plotar bmi vs. avg_glucose_level
+
+df_final_cluster %>%
+  ggplot(aes(x=avg_glucose_level, y=bmi,color=cluster, fill=cluster)) +
+  geom_point(alpha=.5)+
+  theme(legend.position="top")+
+  labs(x = "avg_glucose_level", y='bmi', title = "bmi vs. avg_glucose_level")+ 
+  theme_minimal()+
+  theme_bw()+
+  facet_grid(~ stroke, scale = "free_y") 
+
+# Plotar avg_glucose_level vs. age
+
+df_final_cluster %>%
+  ggplot(aes(x=age, y=avg_glucose_level,color=cluster, fill=cluster)) +
+  geom_point(alpha=.5)+
+  theme(legend.position="top")+
+  labs(x = "age", y='avg_glucose_level', title = "age vs. avg_glucose_level")+ 
+  theme_minimal()+
+  theme_bw()+
+  facet_grid(~ stroke, scale = "free_y") 
+
+
+
+# Plotar gender vs. stroke
+
+df_grouped_stroke_gender <- df_final_cluster %>%
+  group_by(gender,stroke) %>%
+    plotly::summarise(total_count = n())
+
+
+df_grouped_stroke_gender %>%
+  ggplot(aes(x = gender, y = total_count, fill = gender)) +
+  geom_bar(position = "dodge", stat = "identity") +
+  labs(x = "gender", title = "gender vs. stroke") + 
+  theme_minimal() +
+  theme_bw() +
+  facet_grid(stroke ~ ., scales = "free_y")
+
+# Plotar hypertension vs. stroke
+
+df_grouped_stroke_hypertension <- df_final_cluster %>%
+  group_by(hypertension,stroke) %>%
+    plotly::summarise(total_count = n())
+
+
+df_grouped_stroke_hypertension %>%
+  ggplot(aes(x = hypertension  , y = total_count, fill = hypertension)) +
+    # Implement a grouped bar chart
+  geom_bar(position = "dodge", stat = "identity")+
+  labs(x = "stroke", title = "hypertension vs. stroke")+ 
+  theme_minimal()+
+  theme_bw() +
+  facet_grid(stroke ~ ., scales = "free_y")
+
+
+# Plotar heart_disease vs. stroke
+
+df_grouped_stroke_heart_disease <- df_final_cluster %>%
+  group_by(heart_disease,stroke) %>%
+    plotly::summarise(total_count = n())
+
+
+df_grouped_stroke_heart_disease %>%
+  ggplot(aes(x = heart_disease  , y = total_count, fill = heart_disease)) +
+    # Implement a grouped bar chart
+  geom_bar(position = "dodge", stat = "identity")+
+  labs(x = "stroke", title = "heart_disease vs. stroke")+ 
+  theme_minimal()+
+  theme_bw() +
+  facet_grid(stroke ~ ., scales = "free_y")
+
+# Plotar ever_married vs. stroke
+
+df_grouped_stroke_ever_married <- df_final_cluster %>%
+  group_by(ever_married,stroke) %>%
+    plotly::summarise(total_count = n())
+
+
+df_grouped_stroke_ever_married %>%
+  ggplot(aes(x = ever_married  , y = total_count, fill = ever_married)) +
+    # Implement a grouped bar chart
+  geom_bar(position = "dodge", stat = "identity")+
+  labs(x = "stroke", title = "ever_married vs. stroke")+ 
+  theme_minimal()+
+  theme_bw() +
+  facet_grid(stroke ~ ., scales = "free_y")
+
+# Plotar work_type vs. stroke
+
+df_grouped_stroke_work_type <- df_final_cluster %>%
+  group_by(work_type,stroke) %>%
+    plotly::summarise(total_count = n())
+
+df_grouped_stroke_work_type %>%
+  ggplot(aes(x = work_type  , y = total_count, fill = work_type)) +
+    # Implement a grouped bar chart
+  geom_bar(position = "dodge", stat = "identity")+
+  labs(x = "stroke", title = "work_type vs. stroke")+ 
+  theme_minimal()+
+  theme_bw() +
+  facet_grid(stroke ~ ., scales = "free_y")
+
+# Plotar Residence_type vs. stroke
+
+df_grouped_stroke_Residence_type <- df_final_cluster %>%
+  group_by(Residence_type,stroke) %>%
+    plotly::summarise(total_count = n())
+
+df_grouped_stroke_Residence_type %>%
+  ggplot(aes(x = Residence_type  , y = total_count, fill = Residence_type)) +
+    # Implement a grouped bar chart
+  geom_bar(position = "dodge", stat = "identity")+
+  labs(x = "stroke", title = "Residence_type vs. stroke")+ 
+  theme_minimal()+
+  theme_bw() +
+  facet_grid(stroke ~ ., scales = "free_y")
+
+# Plotar smoking_status vs. stroke
+
+df_grouped_stroke_smoking_status <- df_final_cluster %>%
+  group_by(smoking_status,stroke) %>%
+    plotly::summarise(total_count = n())
+
+df_grouped_stroke_smoking_status %>%
+  ggplot(aes(x = smoking_status  , y = total_count, fill = smoking_status)) +
+    # Implement a grouped bar chart
+  geom_bar(position = "dodge", stat = "identity")+
+  labs(x = "stroke", title = "smoking_status vs. stroke")+ 
+  theme_minimal()+
+  theme_bw() +
+  facet_grid(stroke ~ ., scales = "free_y")
+
+library(GGally)
+
+print("verificamos necessidade de fazer log em 'bmi' e em 'avg_glucose_level', para normaliza-las")
+df |> 
+  select_if(is.numeric) |>
+  select(-id) |>
+  mutate(
+    avg_glucose_level2 = log(avg_glucose_level),
+    bmi2 = log(bmi)
+    ) |>
+  ggpairs()
+
+```
+
+Podemos verificar que:
+
+- **Age x BMI**: Pessoas no cluster 1 são majoritariamente mais velhas e com valores mais altos de IMC, contendo quase todos os indivíduos que tiveram derrame;
+- **BMI x avg_glucose_level e age x avg_glucose_level**:  maior parte dos indivíduos do cluster 2 tem nível médio de glicose abaixo de 150, enquanto no cluster 1 parece haver uma separação mais equilibrada, tendo uma concentração entre 50 e 125, e outra entre 200 e 250;
+- **Gender**: A proporção de homens e mulheres dentro dos grupos de pacientes que tiveram e não tiveram derrame é parecida, indicando que o gênero não possui muita relevância para ocorrência do evento;
+- **hypertension**: Pacientes com hipertensão tem maior proporção dentro do grupo que apresentou derrame em relação ao que não apresentou (26% x 8%);
+- **heart_disease**: Pacientes com doenças cardiacas tem maior proporção dentro do grupo que apresentou derrame em relação ao que não apresentou (18% x 4%);
+- **ever_married**: Pacientes que são ou já foram casados tem maior proporção dentro do grupo que apresentou derrame em relação ao que não apresentou (88% x 64%);
+- **work_type**: Pacientes que trabalham na área privada tem proporções parecidas dentro dos grupos que tiveram e não tiveram derrame, porém autônomos ('Self-employed') representam 26% do grupo com derrame enquanto são apenas 15% do grupo que não apresentou;
+- **Residence_type**: A proporção de pacientes que vivem em area urbana e rural dentro dos grupos de que tiveram e não tiveram derrame é parecida, indicando que o o tipo de residência não possui muita relevância para ocorrência do evento;
+- **smoking_status**: formerly smoked  representam 28% do grupo com derrame enquanto são apenas 16% do grupo que não apresentou, demais categorias conhecidas possuem proporções semelhantes;
+
+## Ajuste dos modelos
+
+### Split da base em treino e teste
+<details>
+<summary>Clique para expandir</summary>
+```{r}
+set.seed(234)
+split <- initial_split(df, prop = 0.8, strata = stroke)
+treinamento <- training(split)
+teste <- testing(split)
+
+prop.table(table(treinamento$stroke))
+prop.table(table(teste$stroke))
+```
+
+### Criação do Tibble de Comparativo do desempenho dos modelos
+<details>
+<summary>Clique para expandir</summary>
+```{r Criação da Tabela de Resultados}
+desempenho <- tibble()
+```
+
+### Criação do recipe, prep e bake do tidymodels com interação
+<details>
+<summary>Clique para expandir</summary>
+```{r, }
+# Transformação de dados - formato tidymodels -------------------------------------
+
+set.seed(234)
+#faz a receita e prepara
+(receita <- recipe(stroke ~ ., data = treinamento) %>%
+   step_rm(id) %>% #remove colunas selecionadas
+   step_zv(all_predictors()) %>% #remove variáveis que contém um único valor
+   step_log(avg_glucose_level, bmi, offset = 0) |> #melhora regressão linear e logistica se variáveis tiverem distribuição exponencial
+   step_impute_median(bmi) %>% #substitui com mediana casos nulos
+   step_interact(~ all_predictors():all_predictors()) %>% #cria interações entre todas as variáveis
+   step_zv(all_predictors()) %>% #remove variáveis que contém um único valor
+   #step_interact(~ all_predictors():all_predictors()) %>%
+   step_normalize(all_numeric(), -all_outcomes()) %>%  #normaliza
+   step_other(all_nominal(), -all_outcomes(), threshold = .05, other = "outros") %>% #chama de outros categorias com representatividade abaixo de 5%
+   step_dummy(all_nominal(), -all_outcomes(), one_hot = TRUE) %>% #transforma categoricas em dummies contendo todas categorias nas colunas (one hot)
+   step_zv(all_predictors()) #remove colunas que contem mesmo valor
+   )
+
+(receita_prep <- prep(receita))
+
+# obtem os dados de treinamento processados
+treinamento_proc <- bake(receita_prep, new_data = NULL)
+
+# obtem os dados de teste processados
+teste_proc <- bake(receita_prep, new_data = teste)
+base_full_proc <- bake(receita_prep, new_data = df)
+```
+
+### Regressão Linear - com interação
+
+```{r}
+
+logreg_cls_spec <- 
+  logistic_reg() %>% 
+  set_engine("glm")
+
+set.seed(1)
+fit_lm <- logreg_cls_spec %>% fit(stroke ~ ., data = treinamento_proc)
+
+desempenho <- desempenho %>% 
+                bind_rows(tibble(prob = predict(fit_lm, new_data = teste_proc, type = "prob")$.pred_1, 
+                                classes = ifelse(teste_proc$stroke == "1", "Yes", "No"), 
+                                metodo = "LM - interact"))
+
+
+```
+
+Os p.valores mais significativos de cada combinação de parâmetro e seus betas estimados:
+```{r}
+tidy(fit_lm) |> arrange(p.value) |> filter(p.value < 0.05)
+```
+
+### LASSO - com interação
+
+Impacto da regularização na AUC
+
+
+
+```{r}
+# Definir os hiperparâmetros para tunagem
+LASSO <- logistic_reg(penalty = tune(), mixture = 1) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+# CV
+set.seed(234)
+cv_split <- vfold_cv(treinamento, v = 10)
+
+# Paralelização
+doParallel::registerDoParallel(makeCluster(16))
+
+tempo <- system.time({
+  LASSO_grid <- tune_grid(LASSO,
+                          receita,
+                          resamples = cv_split,
+                          grid = 100,
+                          metrics = metric_set(roc_auc))
+})
+
+autoplot(LASSO_grid)  # Plota os resultados do grid search
+```
+
+Grid dos melhores resultados de acordo com tunning de lambda/penalidade
+```{r echo=FALSE}
+# Visualiza o tibble dos melhores resultados
+LASSO_grid %>%
+  collect_metrics() %>%   
+  arrange(desc(mean)) |>
+  head()
+```
+
+
+Variáveis e interações mais importantes pela biblioteca VIP
+(que mais afetam o erro do modelo caso sejam alteradas aleatoriamente)
+```{r}
+# Seleciona o melhor conjunto de hiperparâmetros
+best_LASSO <- LASSO_grid %>%
+  select_best("roc_auc") #select_by_one_std_err() ou select_best()
+
+#tempo # mostra o tempo de execução
+
+# Faz o fit do modelo com o melhor conjunto de hiperparâmetros
+LASSO_fit <- finalize_model(LASSO, parameters = best_LASSO) %>%
+  fit(stroke ~ ., data = treinamento_proc)
+
+pred_LASSO <- predict(LASSO_fit, new_data = teste_proc, type = "prob")$.pred_1 #pega coluna que dá probabilidade de ter o derrame
+
+desempenho <- desempenho %>% 
+                bind_rows(tibble(prob = pred_LASSO, 
+                                classes = ifelse(teste_proc$stroke == "1", "Yes", "No"), 
+                                metodo = "LASSO - interact"))
+
+#desempenho %>% view()
+
+# visualizando variáveis mais importantes
+vip(LASSO_fit, num_features = 10, nsim = 10)
+#vip::vi(LASSO_fit, num_features = 10, nsim = 10)
+```
+
+
+Interações de variáveis mais importantes: de maior beta em módulo
+```{r}
+# Obter os betas em ordem decrescente
+tidy(LASSO_fit) |> arrange(desc(abs(estimate))) |> head(8)
+```
+
+### Criação do recipe, prep e bake do tidymodels sem interação
+<details>
+<summary>Clique para expandir</summary>
+
+```{r, receita}
+# Transformação de dados - formato tidymodels -------------------------------------
+
+set.seed(234)
+#faz a receita e prepara
+(receita <- recipe(stroke ~ ., data = treinamento) %>%
+   step_rm(id) %>% #remove colunas selecionadas
+   step_zv(all_predictors()) %>% #remove variáveis que contém um único valor
+   step_log(avg_glucose_level, bmi) |> #melhora regressão linear e logistica se variáveis tiverem crescimento exponencial
+   step_impute_median(bmi) %>% #substitui com mediana casos nulos
+   #step_interact(~ all_predictors():all_predictors()) %>% #cria interações entre todas as variáveis
+   #step_zv(all_predictors()) %>% #remove variáveis que contém um único valor
+   #step_interact(~ all_predictors():all_predictors()) %>%
+   step_normalize(all_numeric(), -all_outcomes()) %>%  #normaliza
+   step_other(all_nominal(), -all_outcomes(), threshold = .05, other = "outros") %>% #chama de outros categorias com representatividade abaixo de 5%
+   step_dummy(all_nominal(), -all_outcomes(), one_hot = TRUE) %>% #transforma categoricas em dummies contendo todas categorias nas colunas (one hot)
+   step_zv(all_predictors()) #remove colunas que contem mesmo valor
+   )
+
+(receita_prep <- prep(receita))
+
+# obtem os dados de treinamento processados
+treinamento_proc <- bake(receita_prep, new_data = NULL)
+
+# obtem os dados de teste processados
+teste_proc <- bake(receita_prep, new_data = teste)
+base_full_proc <- bake(receita_prep, new_data = df)
+
+#treinamento_proc %>% ncol()
+teste %>% ncol()
+teste_proc %>% ncol()
+```
+
+### Regressão Linear - sem interação
+
+Os p.valores mais significativos de cada parâmetro e seus betas estimados:
+```{r}
+logreg_cls_spec <- 
+  logistic_reg() %>% 
+  set_engine("glm")
+
+set.seed(1)
+fit_lm <- logreg_cls_spec %>% fit(stroke ~ ., data = treinamento_proc)
+
+pred_lm <- predict(fit_lm, new_data = teste_proc, type = "prob")$.pred_1
+
+desempenho <- desempenho %>% 
+                bind_rows(tibble(prob = pred_lm, 
+                                classes = ifelse(teste_proc$stroke == "1", "Yes", "No"), 
+                                metodo = "LM"))
+
+# Carregar o pacote broom
+library(broom)
+
+tidy(fit_lm) |> arrange(p.value) |> filter(p.value < 0.05)
+```
+
+# Criação e ajuste dos modelos
+### Elastic Net - sem interação
+
+Interação das alterações dos hiperparametros lambda e alpha na AUC
+```{r}
+# Definir os hiperparâmetros para tunagem
+enet <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+# CV
+set.seed(234)
+cv_split <- vfold_cv(treinamento, v = 10)
+
+# Paralelização
+doParallel::registerDoParallel(makeCluster(16))
+
+tempo <- system.time({
+  enet_grid <- tune_grid(enet,
+                         receita,
+                         resamples = cv_split,
+                         grid = 100,
+                         metrics = metric_set(roc_auc))
+})
+
+autoplot(enet_grid)  # Plota os resultados do grid search
+```
+
+Melhor grid de parâmetros de acordo com a métrica AUC
+```{r}
+enet_grid %>%
+  collect_metrics() %>%   # Visualiza o tibble de resultados
+  arrange(desc(mean)) |> head()
+```
+
+Variáveis mais importantes pela biblioteca VIP
+(que mais afetam o erro do modelo caso sejam alteradas aleatóriamente)
+```{r}
+
+
+# Seleciona o melhor conjunto de hiperparâmetros
+best_enet <- enet_grid %>%
+  select_by_one_std_err("roc_auc") #select_by_one_std_err() ou select_best()
+
+# tempo #grid = 50, 106s
+
+# Faz o fit do modelo com o melhor conjunto de hiperparâmetros
+enet_fit <- finalize_model(enet, parameters = best_enet) %>%
+  fit(stroke ~ ., data = treinamento_proc)
+
+pred_enet <- predict(enet_fit, new_data = teste_proc, type = "prob")$.pred_1 #pega coluna que dá probabilidade de ter o derrame
+
+desempenho <- desempenho %>% 
+                bind_rows(tibble(prob = pred_enet, 
+                                classes = ifelse(teste_proc$stroke == "1", "Yes", "No"), 
+                                metodo = "Elastic Net"))
+
+#desempenho %>% view()
+
+# visualizando variáveis mais importantes
+vip(enet_fit, num_features = 20)
+```
+
+Variáveis mais importantes: de maior beta em módulo
+```{r}
+# Carregar o pacote broom
+library(broom)
+
+# Obter os coeficientes e o intercepto em ordem decrescente
+tidy(enet_fit) |> arrange(desc(abs(estimate))) |> head(8)
+```
+
+### Modelo Random Forest
+
+Tunning dos hiperparâmetros
+```{r}
+# Definir os hiperparâmetros para tunagem
+rf <- rand_forest(trees = tune(), mtry = tune(), min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+# CV
+set.seed(234)
+cv_split <- vfold_cv(treinamento, v = 5)
+
+# Paralelização
+doParallel::registerDoParallel(makeCluster(16))
+
+tempo <- system.time({
+  rf_grid <- tune_grid(rf,
+                       receita,
+                       resamples = cv_split,
+                       grid = 50,
+                       metrics = metric_set(roc_auc))
+})
+
+autoplot(rf_grid)  # Plota os resultados do grid search
+```
+
+Melhor grid de parâmetros de acordo com a métrica AUC
+```{r}
+rf_grid %>%
+  collect_metrics() %>%   # Visualiza o tibble de resultados
+  arrange(desc(mean))
+
+```
+
+Variáveis mais importantes pela biblioteca VIP
+(que mais afetam o erro do modelo caso sejam alteradas aleatóriamente)
+```{r}
+# Seleciona o melhor conjunto de hiperparâmetros
+best_rf <- rf_grid %>%
+  select_best("roc_auc")
+
+#tempo #grid = 50, 106s
+
+# Faz o fit do modelo com o melhor conjunto de hiperparâmetros
+rf_fit <- finalize_model(rf, parameters = best_rf) %>%
+  fit(stroke ~ ., data = treinamento_proc)
+
+pred_rf <- predict(rf_fit, new_data = teste_proc, type = "prob")$.pred_1 #pega coluna que dá probabilidade de ter o derrame
+
+desempenho <- desempenho %>% 
+                bind_rows(tibble(prob = pred_rf, 
+                                classes = ifelse(teste_proc$stroke == "1", "Yes", "No"), 
+                                metodo = "Random Forest"))
+
+#desempenho %>% view()
+
+# visualizando variáveis mais importantes
+vip(rf_fit, aesthetics = list(fill = "#FF5757"))  #melhor para explicar causalidade
+
+```
+
+### Modelo XGBOOST
+
+Tunning dos hiperparâmetros
+```{r}
+boost <- boost_tree(trees = tune(), learn_rate = tune(), mtry = tune(),
+                    tree_depth = tune(), min_n = tune(), sample_size = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+# cv
+set.seed(234)
+cv_split <- vfold_cv(treinamento, v = 5)
+
+# otimização de hiperparametro
+doParallel::registerDoParallel(16) #colocar nro de cores da maquina
+
+tempo <- system.time({
+  boost_grid <- tune_grid(boost,
+                          receita,
+                          resamples = cv_split,
+                          grid = 50,
+                          metrics = metric_set(roc_auc))
+})
+
+autoplot(boost_grid) # plota os resultados do grid search
+```
+
+Melhor grid de parâmetros de acordo com a métrica AUC
+```{r}
+boost_grid %>%
+  collect_metrics()  %>%   # visualiza o tibble de resultados
+  arrange(desc(mean))
+```
+
+Variáveis mais importantes pela biblioteca VIP
+(que mais afetam o erro do modelo caso sejam alteradas aleatóriamente)
+```{r}
+(best_xgb <- boost_grid %>%
+    select_best("roc_auc")) # salva o melhor conjunto de parametros
+
+# tempo #grid = 50, 161s
+
+#faz o fit do modelo com o melhor conjunto de hiperparâmetros
+boost_fit <- finalize_model(boost, parameters = best_xgb) %>%
+  fit(stroke ~ ., treinamento_proc)
+
+pred_xgbm <- predict(boost_fit, new_data = teste_proc, type = "prob")$.pred_1
+
+desempenho <- desempenho %>% 
+                bind_rows(tibble(prob = pred_xgbm, 
+                                classes = ifelse(teste_proc$stroke == "1", "Yes", "No"), 
+                                metodo = "XGBM"))
+
+# visualizando variáveis mais importantes
+vip(boost_fit)
+```
+
+### Redes Neurais
+Definição de estrutura e loading de pesos treinados
+```{r, redes neurais}
+
+#desempenho <- desempenho |> filter(metodo != "Neural Networks")
+
+X_trn <- treinamento_proc %>% dplyr::select(-stroke) %>% as.matrix()
+X_tst <- teste_proc %>% dplyr::select(-stroke) %>% as.matrix()
+
+y_trn <- treinamento_proc$stroke %>% to_categorical()
+y_tst <- teste_proc$stroke %>% to_categorical()
+
+#net <- NULL
+# Modelo Sequencial
+net <- keras_model_sequential() %>%
+  layer_dense(units = 512, activation = "relu", input_shape = ncol(X_trn)) %>%
+  layer_dropout(rate = 0.4) %>%
+  layer_dense(units = 256, activation = "relu") %>%
+  layer_dropout(rate = 0.4) %>%
+  layer_dense(units = 128, activation = "relu") %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 64, activation = "relu") %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 32, activation = "relu") %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 16, activation = "relu") %>%
+  layer_dropout(rate = 0.1) %>%
+  layer_dense(units = 2, activation = "softmax")  # Camada de saída com ativação sigmoid
+
+
+# definicao do estimador da rede neural
+net %>%
+  compile(loss = "categorical_crossentropy",
+          optimizer = optimizer_rmsprop(),
+          metrics = c("Recall") 
+          )
+
+#accuracy Recall(sensibilidade) Precision
+
+summary(net)
+```
+
+Treina o modelo de redes neurais e salva
+```{r, treina e prediz, eval=FALSE}
+tensorflow::set_random_seed(123)
+
+# Definindo o callback de Early Stopping
+callback <- callback_early_stopping(
+  monitor = "val_loss",  # Métrica a ser monitorada
+  patience = 50,          # Número de épocas para esperar após a parada de melhorias
+  restore_best_weights = TRUE)  # Restaura os pesos do modelo para a melhor época
+
+
+history <- net %>%
+  fit(X_trn, y_trn, epochs = 10000,
+      batch_size = 80, validation_split = 0.2, #DIVIDE O TOTAL DE DADOS EM 80 BLOCOS
+      callbacks = list(callback)) #pega 20% pra validar enquanto roda
+
+#plot(history)
+
+# Salvando os pesos do modelo
+save_model_weights_hdf5(net, "pesos_nn_1.h5")
+
+```
+
+carrega pesos salvos, prediz e carrega predição na base comparativa
+```{r, tstt}
+# Carregando os pesos salvos no modelo
+net %>% load_model_weights_hdf5("pesos_nn_1.h5")
+
+pred_nn <- predict(net, X_tst)[,2] #prob de apresentar o evento
+
+desempenho <- desempenho %>% 
+                bind_rows(tibble(prob = pred_nn, 
+                                classes = ifelse(teste_proc$stroke == "1", "Yes", "No"), 
+                                metodo = "Neural Networks"))
+                              
+```
+
+### Modelo de redes neurais com 200 epocas (sem call back)
+```{r, redes neurais 2, include=FALSE}
+X_trn <- treinamento_proc %>% dplyr::select(-stroke) %>% as.matrix()
+X_tst <- teste_proc %>% dplyr::select(-stroke) %>% as.matrix()
+
+y_trn <- treinamento_proc$stroke %>% to_categorical()
+y_tst <- teste_proc$stroke %>% to_categorical()
+
+# Modelo Sequencial
+net <- keras_model_sequential() %>%
+  layer_dense(units = 512, activation = "relu", input_shape = ncol(X_trn)) %>%
+  layer_dropout(rate = 0.4) %>%
+  layer_dense(units = 256, activation = "relu") %>%
+  layer_dropout(rate = 0.4) %>%
+  layer_dense(units = 128, activation = "relu") %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 64, activation = "relu") %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 32, activation = "relu") %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 16, activation = "relu") %>%
+  layer_dropout(rate = 0.1) %>%
+  layer_dense(units = 2, activation = "softmax")  # Camada de saída com ativação sigmoid
+
+
+
+
+#definicao do estimador da rede neural
+net %>%
+  compile(loss = "categorical_crossentropy",
+          optimizer = optimizer_rmsprop(),
+          metrics = c("Recall"))
+
+```
+
+Treina o modelo de redes neurais e salva
+```{r, treina e prediz 2, eval=FALSE}
+tensorflow::set_random_seed(42)
+
+history <- net %>%
+  fit(X_trn, y_trn, epochs = 200,
+      batch_size = 80, validation_split = 0.2) 
+
+# Salvando os pesos do modelo
+save_model_weights_hdf5(net, "pesos_nn_2.h5")
+```
+
+```{r}
+# Carregando os pesos salvos no modelo
+net %>% load_model_weights_hdf5("pesos_nn_2.h5")
+
+pred_nn_2 <- predict(net, X_tst)[,2] #prob de apresentar o evento
+
+desempenho <- desempenho %>% 
+                bind_rows(tibble(prob = pred_nn_2, 
+                                classes = ifelse(teste_proc$stroke == "1", "Yes", "No"), 
+                                metodo = "Neural Networks - sem callback"))
+```
+
+## Comparativo de todos os modelos
+
+Como esperado redes neurais com callback teve melhor desempenho que sem callback
+```{r Faz previsão mede e compara 2}
+desempenho %>% 
+  mutate(classes = factor(classes)) %>% 
+  group_by(metodo) %>% 
+  roc_auc(classes, prob, event_level = "second") %>% 
+  arrange(desc(.estimate))
+```
+
+Curva AUC
+```{r}
+desempenho %>% 
+  mutate(classes = factor(classes)) %>% 
+  group_by(metodo) %>% 
+  roc_curve(classes, prob, event_level = "second") %>% 
+  autoplot()
+```
+
+# Análise aprofundada dos modelos e pontos de corte
+
+Para mensurar o melhor ponto de corte definimos uma variavel chamada "campo" que é o produto de ppv por sensibilidade. Para dar uma importancia maior para sensibilidade
+elevamos ela ao cubo. Para ficar mais fácil de vizualisar o resultado final multiplicamos por 100. Ordenamos em ordem decrescente os 3 principais pontos de corte.
+Estamos considerando todos os gráficos pois, não necessariamente o modelo com maior auc será o melhor para nosso problema em questão.
+
+accuracy            : acertos/casos totais
+
+sensitivity/recall  : acertos positivos/total de positivos
+
+specificity         : assertos negativos/total de negativos reais
+1-specificity       : erros negativos/total de negativos reais         (% dos totais que não terão derrame que fizeram exame em vão)
+
+ppv/precisão        : assertos positivos/total de positivos previstos  (% das pessoas chamadas que realmente terão derrame)
+npv                 : assertos negativos/total de negativos previstos  (% das pessoas que não serão chamadas que realmente não terão derrame)
+
+recall              : assertos positivos/total de positivos reais
+
+Crio função para calcular formula de campo para cada modelo para cada ponto de corte utilizando calculo que leve em consideração os pesos da sensibilidade e especificidade para o negócio em questão.
+Melhor modelo e melhor ponto de corte obtido:
+```{r}
+# Função para calcular o valor do campo
+calc_campo <- function(pred, model_name) {
+  coords(roc(teste_proc$stroke, pred), c(seq(.001,.5,.001)),
+         ret = c("threshold","accuracy", "sensitivity", "specificity", "1-specificity", "ppv", "npv")) %>% 
+    mutate(campo = (sensitivity^3)*specificity, model = model_name)  %>% 
+    arrange(desc(campo)) 
+}
+
+# Lista de previsões
+pred_list <- list(LASSO = pred_LASSO, lm = pred_lm, enet = pred_enet, rf = pred_rf, xgbm = pred_xgbm, nn = pred_nn,  nnscall = pred_nn_2)
+
+# Aplica a função a cada conjunto de previsões
+campo_values <- lapply(names(pred_list), function(x) calc_campo(pred_list[[x]], x))
+
+# Combina os resultados em um data frame
+campo_df <- do.call(rbind, campo_values)
+
+# Retorna a linha com o maior valor do campo
+campo_df[which.max(campo_df$campo), ]
+```
+
+Matriz de confusão do melhor modelo e ponto de corte
+```{r}
+corte <- 0.021
+
+previsoes_1_1 <- ifelse(pred_LASSO >= corte, 1, 0) %>% as.tibble
+
+previsoes_1_1 <- previsoes_1_1 %>% bind_cols(tibble(obs = teste_proc$stroke))
+
+table(previsoes_1_1) |> `dimnames<-`(list(previsto = c("0", "1"), real = c("0", "1")))
+
+```
+
+Conclusão: ao fazer exame nos casos com 2.1% ou mais de probabilidade segundo previsão do modelo LASSO, estaremos diminuindo em aproximadamente 46% a quantidade de exames necessárias
+enquanto somente 2 pessoas com derrame ficariam de fora da previsão. Isso gerara ganhos consideraveis para o hospital e ganhos indiretos aos pacientes, uma vez que com menos
+pacientes na fila os exames teoricamente devem sair mais rápido e o atendimento deve ser melhor.
+
+De que forma podemos obter ganhos diretos para os pacientes?
+E se quisermos dar prioridade para casos com probabilidade de derrame mais elevada? 
+
+pro ponto de corte de 20% qual modelo possui melhor valor de "campo" ?
+
+
+**xgbm é o melhor modelo para um ponto de corte de 20% de probabilidade de derrame**
+```{r}
+#escolhe a resposta com maior campo. desta vez sensibilidade (quem é deixado de fora) tem peso normal pois step anterior já leva ela em consideração
+
+# Função para calcular o valor do campo
+calc_campo <- function(pred) {
+  coords(roc(teste_proc$stroke, pred), .2,
+         ret = c("threshold","accuracy", "sensitivity", "specificity", "1-specificity", "ppv", "npv")) %>% 
+    mutate(campo = (sensitivity^1)*specificity*10) %>% 
+    pull(campo)
+}
+
+# Lista de previsões
+pred_list <- list(LASSO = pred_LASSO, lm = pred_lm, enet = pred_enet, rf = pred_rf, xgbm = pred_xgbm, nn = pred_nn,  nnscall = pred_nn_2)
+
+# Aplica a função a cada conjunto de previsões
+(campo_values <- lapply(pred_list, calc_campo))
+```
+
+Lista de prioridade de exames obtida após executar os modelos:
+```{r}
+corte <- 0.2 #20%
+
+previsoes_2 <- ifelse(pred_xgbm >= corte, 1, 0) %>% as.tibble %>% setNames("valor2")
+
+lista_prioritaria <- teste_proc %>% 
+                bind_cols(previsoes_1_1) %>% bind_cols(previsoes_2)
+
+lista_prioritaria  <- lista_prioritaria %>% mutate(resultado=ifelse(value == 1, "em risco", "sem risco"),
+                                                   resultado = ifelse(valor2 == 1, "urgente", resultado)) %>% dplyr::select(-value, -valor2)
+
+lista_prioritaria$resultado %>% table()
+```
+
+Percentual de pacientes que teriam derrame e ficariam de fora (falsos negativos):
+```{r}
+(lista_prioritaria %>% filter(resultado == 'sem risco' & stroke == 1) %>% nrow()/lista_prioritaria %>% dplyr::filter(stroke == 1) %>% nrow())*100
+```
+
+Percentual de exames diminuidos:
+```{r}
+#Percentual de exames diminuidos
+(1-(lista_prioritaria %>% filter(resultado != 'sem risco') %>% nrow()/nrow(previsoes_1_1)))*100
+```
+
+
+Geramos uma lista indicando se o paciente precisará ou não realizar um exame e, caso necessário, classificamos como "urgente" aqueles com probabilidade igual ou superior a 20% de apresentar um derrame.
+
+Curiosamente, um dos modelos com AUC mais baixa em comparação com os outros (XGBM) foi o mais eficaz na previsão de casos críticos (probabilidade de AVC acima de 20%). Isso demonstra que, para modelos de classificação, é mais importante ter um modelo específico para o problema em questão do que um modelo com maior AUC para todos os pontos de corte.
